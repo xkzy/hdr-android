@@ -1,12 +1,12 @@
 buildscript {
-    ext.kotlin_version = "1.9.22"
     repositories {
         google()
         mavenCentral()
     }
     dependencies {
-        classpath "com.android.tools.build:gradle:8.2.2"
-        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:$kotlin_version"
+        // Kotlin support is built into AGP 9+ (runtime-dependent on Kotlin Gradle
+        // plugin 2.2.10); no separate kotlin-gradle-plugin classpath entry needed.
+        classpath "com.android.tools.build:gradle:9.3.0"
     }
 }
 
