@@ -118,9 +118,15 @@ class MainActivity : AppCompatActivity() {
 
         scope.launch {
             try {
-                val frames = ctrl.captureBracket(previewSurface, outSize, config) { done, total ->
-                    runOnUiThread { statusText.text = "Capturing $done/$total..." }
-                }
+                val frames = ctrl.captureBracket(
+                    previewSurface, outSize, config,
+                    onProgress = { done, total ->
+                        runOnUiThread { statusText.text = "Capturing $done/$total..." }
+                    },
+                    onStatus = { message ->
+                        runOnUiThread { statusText.text = message }
+                    }
+                )
                 runOnUiThread { statusText.text = "Fusing (argmax saturation)..." }
                 val fused = SaturationFusion.fuse(frames)
                 val uri = saveToGallery(fused)
