@@ -1,6 +1,11 @@
 package com.example.hdrfusion
 
 import android.graphics.Bitmap
+import android.graphics.Canvas
+import android.graphics.Matrix
+import android.graphics.Paint
+import kotlin.math.abs
+import kotlin.math.atan2
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -8,21 +13,27 @@ import kotlin.math.sqrt
 
 /**
  * Compensates for hand shake *between* bracket frames. [MotionMonitor]'s per-frame IMU
- * check guards against blur *within* a single exposure, but the hand can still drift a
- * few pixels between shots over the second or two a multi-step bracket takes. Since
- * [SaturationFusion] is a strict per-pixel argmax across frames, that drift shows up as
+ * check guards against blur *within* a single exposure, but the hand can still drift and
+ * twist a few pixels/degrees between shots over the second or two a multi-step bracket
+ * takes. Since [SaturationFusion] blends per-pixel across frames, that drift shows up as
  * ghosting/misregistration — most visible as fringing at high-contrast edges.
  *
- * This does a translation-only (no rotation/scale) coarse-to-fine search for the pixel
- * offset that best aligns each frame to the first ("reference") frame, using normalized
- * cross-correlation over downsampled luma, then crops every frame to the region common
- * to all of them post-shift so the fused output has no ragged/invalid edges.
+ * This corrects two kinds of motion, in order:
+ * 1. **Small-angle rotation** ([correctRotation]) — a two-patch shift-difference estimate
+ *    (see its doc) catches the wrist-twist component of handshake that a pure translation
+ *    search cannot, applied and clamped conservatively since it's a coarse estimate.
+ * 2. **Translation** ([estimateShift]) — coarse-to-fine normalized cross-correlation search,
+ *    same as before, now run on the already-derotated frame.
  *
- * What this does NOT fix: a moving subject in an otherwise static scene. That needs
- * per-object motion estimation (optical flow, or feature-based deghosting), which is a
- * different and much larger problem than a single global 2D shift — out of scope here,
- * and inherent to any per-pixel argmax fusion, not something a global alignment step
- * could paper over.
+ * Frames are then cropped to the region common to all of them post-correction so the fused
+ * output has no ragged/invalid edges.
+ *
+ * What this still does NOT fix: scale/perspective changes (e.g. the phone drifting closer/
+ * farther, or tilting off-axis rather than twisting in-plane), or a moving subject in an
+ * otherwise static scene. Those need a full homography or per-object motion estimation
+ * (optical flow / feature-based registration) — a different and much larger problem than the
+ * small-angle rigid correction here, and inherent to any per-pixel fusion, not something a
+ * global alignment step could paper over.
  */
 object ImageAligner {
 
@@ -31,12 +42,24 @@ object ImageAligner {
     private const val PYRAMID_BASE_DIM = 48
     private const val PYRAMID_TOP_DIM = 384
 
+    /** Downsampled size used only for the two-patch rotation estimate. */
+    private const val ROTATION_ANALYSIS_DIM = 240
+    private const val ROTATION_SEARCH_RADIUS = 6
+    /** Below this, treat the estimate as measurement noise rather than real rotation. */
+    private const val ROTATION_MIN_DEGREES = 0.15f
+    /** Above this, distrust the (coarse, linear) estimate rather than risk overcorrecting. */
+    private const val ROTATION_MAX_DEGREES = 4.0f
+
     /** Aligns every frame to frames[0] and crops all of them to the shared overlap region. */
     fun alignAndCrop(frames: List<Bitmap>): List<Bitmap> {
         if (frames.size <= 1) return frames
         val reference = frames[0]
 
-        val shifts = frames.map { frame ->
+        val derotated = frames.map { frame ->
+            if (frame === reference) frame else correctRotation(reference, frame)
+        }
+
+        val shifts = derotated.map { frame ->
             if (frame === reference) 0 to 0 else estimateShift(reference, frame)
         }
 
@@ -55,10 +78,85 @@ object ImageAligner {
         // rather than fail the whole shoot over it.
         if (cropW <= 0 || cropH <= 0) return frames
 
-        return frames.mapIndexed { i, frame ->
+        return derotated.mapIndexed { i, frame ->
             val (dx, dy) = shifts[i]
             Bitmap.createBitmap(frame, x0 + dx, y0 + dy, cropW, cropH)
         }
+    }
+
+    /**
+     * Corrects the in-plane rotation component of handshake (the wrist naturally twists
+     * slightly during a multi-frame bracket, not just translates) that a translation-only
+     * search cannot represent at all — no (dx,dy) can align a rotated frame to its reference
+     * away from the center of rotation.
+     *
+     * Estimated via two independent translation searches on a left-side and right-side patch
+     * of the frame: for a pure rotation by angle θ around the image center, a point offset by
+     * +r from center moves tangentially by ~r·θ in the opposite sense to a point at -r — so
+     * the *difference* in vertical shift between a left patch and a right patch, divided by
+     * the horizontal distance between them, approximates θ (small-angle: tan θ ≈ θ). This is
+     * a coarse, linear approximation — it ignores any true translation-vs-rotation coupling
+     * beyond first order, and treats the two patches' independent noise as if it were signal —
+     * so the result is clamped to a small range and estimates below the noise floor are
+     * ignored entirely (see [ROTATION_MIN_DEGREES]/[ROTATION_MAX_DEGREES]) rather than trusted
+     * outright. This is not a substitute for proper feature-based homography estimation; it
+     * only targets the common case of a few tenths to a few degrees of handshake twist.
+     */
+    private fun correctRotation(reference: Bitmap, moving: Bitmap): Bitmap {
+        val maxDim = max(reference.width, reference.height)
+        val scale = min(1f, ROTATION_ANALYSIS_DIM.toFloat() / maxDim)
+        val refL = downsampleLuma(reference, scale)
+        val movL = downsampleLuma(moving, scale)
+
+        val patchW = refL.w / 3
+        val yStart = refL.h / 4
+        val yEnd = refL.h - yStart
+        if (patchW < 8 || yEnd <= yStart) return moving
+
+        val leftShift = searchRegionShift(refL, movL, 0, patchW, yStart, yEnd, ROTATION_SEARCH_RADIUS)
+        val rightShift = searchRegionShift(refL, movL, refL.w - patchW, refL.w, yStart, yEnd, ROTATION_SEARCH_RADIUS)
+
+        val patchCenterSeparationPx = (refL.w - patchW / 2) - (patchW / 2)
+        if (patchCenterSeparationPx <= 0) return moving
+
+        val dyDiff = (rightShift.second - leftShift.second).toDouble()
+        val angleDeg = Math.toDegrees(atan2(dyDiff, patchCenterSeparationPx.toDouble())).toFloat()
+
+        if (abs(angleDeg) < ROTATION_MIN_DEGREES) return moving
+        val clamped = angleDeg.coerceIn(-ROTATION_MAX_DEGREES, ROTATION_MAX_DEGREES)
+
+        val matrix = Matrix().apply {
+            postRotate(-clamped, moving.width / 2f, moving.height / 2f)
+        }
+        val output = Bitmap.createBitmap(moving.width, moving.height, Bitmap.Config.ARGB_8888)
+        Canvas(output).drawBitmap(moving, matrix, Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG))
+        return output
+    }
+
+    /** Brute-force best (dx,dy) within [radius] that maximizes correlation over one sub-region. */
+    private fun searchRegionShift(
+        reference: LumaImage,
+        moving: LumaImage,
+        xStart: Int,
+        xEnd: Int,
+        yStart: Int,
+        yEnd: Int,
+        radius: Int
+    ): Pair<Int, Int> {
+        var bestScore = Double.NEGATIVE_INFINITY
+        var bestDx = 0
+        var bestDy = 0
+        for (dy in -radius..radius) {
+            for (dx in -radius..radius) {
+                val score = regionCorrelationAt(reference, moving, dx, dy, xStart, xEnd, yStart, yEnd)
+                if (score > bestScore) {
+                    bestScore = score
+                    bestDx = dx
+                    bestDy = dy
+                }
+            }
+        }
+        return bestDx to bestDy
     }
 
     /**
@@ -132,19 +230,33 @@ object ImageAligner {
 
     /** Normalized cross-correlation between reference and moving-shifted-by-(dx,dy), over their overlap. */
     private fun correlationAt(reference: LumaImage, moving: LumaImage, dx: Int, dy: Int): Double {
-        val w = min(reference.w, moving.w)
-        val h = min(reference.h, moving.h)
-        val xStart = max(0, -dx)
-        val xEnd = min(w, w - dx)
-        val yStart = max(0, -dy)
-        val yEnd = min(h, h - dy)
-        if (xEnd <= xStart || yEnd <= yStart) return Double.NEGATIVE_INFINITY
+        return regionCorrelationAt(reference, moving, dx, dy, 0, min(reference.w, moving.w), 0, min(reference.h, moving.h))
+    }
+
+    /** Normalized cross-correlation restricted to [xStart,xEnd) x [yStart,yEnd) of the reference frame. */
+    private fun regionCorrelationAt(
+        reference: LumaImage,
+        moving: LumaImage,
+        dx: Int,
+        dy: Int,
+        xStart: Int,
+        xEnd: Int,
+        yStart: Int,
+        yEnd: Int
+    ): Double {
+        val movW = moving.w
+        val movH = moving.h
+        val clampedXStart = max(xStart, -dx)
+        val clampedXEnd = min(xEnd, movW - dx)
+        val clampedYStart = max(yStart, -dy)
+        val clampedYEnd = min(yEnd, movH - dy)
+        if (clampedXEnd <= clampedXStart || clampedYEnd <= clampedYStart) return Double.NEGATIVE_INFINITY
 
         var sumA = 0.0; var sumB = 0.0; var sumAB = 0.0; var sumA2 = 0.0; var sumB2 = 0.0; var n = 0
-        for (y in yStart until yEnd) {
+        for (y in clampedYStart until clampedYEnd) {
             val refRow = y * reference.w
-            val movRow = (y + dy) * moving.w
-            for (x in xStart until xEnd) {
+            val movRow = (y + dy) * movW
+            for (x in clampedXStart until clampedXEnd) {
                 val a = reference.data[refRow + x].toDouble()
                 val b = moving.data[movRow + x + dx].toDouble()
                 sumA += a; sumB += b; sumAB += a * b; sumA2 += a * a; sumB2 += b * b
