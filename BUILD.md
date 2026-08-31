@@ -14,7 +14,6 @@
    ```bash
    git clone https://github.com/xkzy/hdr-android.git
    cd hdr-android
-   git checkout claude/saturation-over-vibrance-s4ysao
    ```
 
 2. **Open in Android Studio**:
