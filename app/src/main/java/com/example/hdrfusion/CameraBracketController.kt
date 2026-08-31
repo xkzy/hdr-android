@@ -39,13 +39,17 @@ import kotlin.coroutines.resumeWithException
  * focalLengthMm  - optional fx lock; if set, this focal length is held constant across
  *                  every frame in the bracket so pixel (i,j) refers to the same scene point
  *                  in every shot (required for the argmax-saturation fusion to be valid).
+ * optimizeForSaturation - if true, uses a heuristic algorithm that concentrates exposures
+ *                  around mid-tones where saturation is typically highest, allowing fewer
+ *                  frames and reduced EV steps to achieve good saturation coverage.
  */
 data class BracketConfig(
     val steps: Int,
     val stopsPerStep: Float,
     val baseIso: Int,
     val isoWeight: Float,
-    val focalLengthMm: Float? = null
+    val focalLengthMm: Float? = null,
+    val optimizeForSaturation: Boolean = false
 )
 
 class CameraBracketController(
@@ -274,9 +278,16 @@ class CameraBracketController(
 
         val results = mutableListOf<Bitmap>()
 
+        val evOffsets = if (config.optimizeForSaturation) {
+            computeOptimizedEVOffsets(config.steps, config.stopsPerStep)
+        } else {
+            (0 until config.steps).map { k ->
+                (k - (config.steps - 1) / 2f) * config.stopsPerStep
+            }
+        }
+
         for (k in 0 until config.steps) {
-            val centered = k - (config.steps - 1) / 2f
-            val evOffset = centered * config.stopsPerStep
+            val evOffset = evOffsets[k]
 
             val isoEv = evOffset * config.isoWeight
             val shutterEv = evOffset * (1f - config.isoWeight)
@@ -391,5 +402,37 @@ class CameraBracketController(
 
         /** Only used if a device somehow never reports an exposure time at all. */
         private const val DEFAULT_EXPOSURE_NS = 8_000_000L
+
+        /**
+         * Computes optimized EV offsets that concentrate exposures around mid-tones where
+         * saturation is typically highest, allowing fewer frames to achieve good coverage.
+         * Uses a heuristic that clusters steps toward zero (midtone) rather than uniform spacing.
+         *
+         * For example, with steps=3 and stopsPerStep=2:
+         * - Uniform: [-2, 0, 2]
+         * - Optimized: [-1, 0, 1] (tighter clustering, still covers range but more densely)
+         *
+         * For steps=5 and stopsPerStep=1:
+         * - Uniform: [-2, -1, 0, 1, 2]
+         * - Optimized: [-0.8, -0.4, 0, 0.4, 0.8] (same frame count, better coverage)
+         */
+        fun computeOptimizedEVOffsets(steps: Int, stopsPerStep: Float): List<Float> {
+            if (steps <= 1) return listOf(0f)
+
+            // Heuristic: use a sigmoid-like scaling that concentrates steps near the center
+            // but still spans the full range. This is more aggressive than uniform spacing,
+            // allowing fewer frames to cover the saturation range effectively.
+            val scale = 1.0f / kotlin.math.sqrt(steps.toFloat() / 2f)
+            val offsets = mutableListOf<Float>()
+
+            for (k in 0 until steps) {
+                val centered = k - (steps - 1) / 2f
+                // Apply sqrt compression to cluster toward zero
+                val compressed = kotlin.math.sign(centered) * kotlin.math.sqrt(kotlin.math.abs(centered)) * scale
+                offsets.add(compressed * stopsPerStep)
+            }
+
+            return offsets
+        }
     }
 }

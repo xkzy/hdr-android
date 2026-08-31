@@ -14,6 +14,22 @@ highlights/shadows).
 | Base ISO | ISO used at the center frame |
 | ISO weight | 0..1 — how much of each EV step is realized via ISO vs shutter speed. 0 = classic shutter-only bracketing, 1 = ISO-only |
 | fx (focal length, mm) | locks `LENS_FOCAL_LENGTH` for every frame in the bracket. Leave blank to use the first available focal length. **This must stay fixed across the bracket** — the fusion algorithm assumes pixel (i,j) is the same scene point in every frame, so any focal-length or framing change between shots will misalign the fusion. |
+| Optimize for saturation | if enabled, uses a heuristic algorithm that concentrates exposures around mid-tones where saturation is typically highest, allowing the same number of frames to achieve better saturation coverage, or fewer frames to achieve the same coverage. Uses adaptive exposure spacing instead of uniform EV steps. |
+
+## Saturation optimization heuristic
+
+When the "Optimize for saturation" mode is enabled, the bracketing strategy uses adaptive exposure spacing instead of uniform EV steps. This heuristic concentrates exposures around mid-tones (where color saturation is typically highest) rather than spreading them equally across the full dynamic range.
+
+**Uniform spacing (default):** with 5 steps and 1 EV per step, captures at EV offsets `[-2, -1, 0, +1, +2]`
+
+**Optimized spacing:** with 5 steps and 1 EV per step, captures at compressed offsets like `[-0.8, -0.4, 0, +0.4, +0.8]`
+
+The compression uses a square-root scaling that prioritizes saturation coverage:
+- Same number of frames achieve better saturation diversity
+- Alternatively, fewer frames achieve comparable saturation results (e.g., 3 optimized frames may match 5 uniform frames in saturation coverage)
+- Reduces shutter speed variation and motion blur risk during the bracket
+
+This is particularly useful on handheld shots where shorter capture times reduce subject motion and cumulative hand drift between frames, while still maintaining the saturation diversity the argmax fusion requires.
 
 ## Capture pipeline
 

@@ -132,6 +132,15 @@
                     android:textColor="#FFFFFF" />
             </LinearLayout>
 
+            <!-- Saturation optimization heuristic -->
+            <CheckBox
+                android:id="@+id/checkOptimizeSaturation"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="8dp"
+                android:textColor="#FFFFFF"
+                android:text="Optimize for saturation (fewer frames, adaptive spacing)" />
+
             <Button
                 android:id="@+id/captureButton"
                 android:layout_width="match_parent"

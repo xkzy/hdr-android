@@ -12,6 +12,7 @@ import android.util.Size
 import android.view.Surface
 import android.view.TextureView
 import android.widget.Button
+import android.widget.CheckBox
 import android.widget.EditText
 import android.widget.TextView
 import android.widget.Toast
@@ -31,6 +32,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var editIso: EditText
     private lateinit var editIsoWeight: EditText
     private lateinit var editFocal: EditText
+    private lateinit var checkOptimizeSaturation: CheckBox
 
     private var controller: CameraBracketController? = null
     private val scope = MainScope()
@@ -55,6 +57,7 @@ class MainActivity : AppCompatActivity() {
         editIso = findViewById(R.id.editIso)
         editIsoWeight = findViewById(R.id.editIsoWeight)
         editFocal = findViewById(R.id.editFocal)
+        checkOptimizeSaturation = findViewById(R.id.checkOptimizeSaturation)
 
         captureButton.setOnClickListener { runBracketAndFuse() }
 
@@ -104,7 +107,8 @@ class MainActivity : AppCompatActivity() {
             stopsPerStep = stops,
             baseIso = baseIso,
             isoWeight = isoWeight,
-            focalLengthMm = focal
+            focalLengthMm = focal,
+            optimizeForSaturation = checkOptimizeSaturation.isChecked
         )
 
         captureButton.isEnabled = false
