@@ -45,6 +45,10 @@ import kotlin.coroutines.resumeWithException
  * useBurstStacking - if true, captures a rapid burst at metered ISO (peak ~127) with fixed
  *                  shutter, then synthesizes multiple exposures via frame stacking with
  *                  optical flow alignment. Reduces motion blur vs traditional bracketing.
+ * targetSnr      - if set (>0), enables adaptive burst length: capture frames until
+ *                  stacked SNR reaches this target. Allows fewer frames in bright scenes,
+ *                  more in low-light. Ignored if useBurstStacking is false.
+ *                  Typical range: 10-100. If <= 0, uses fixed `steps` frame count.
  */
 data class BracketConfig(
     val steps: Int,
@@ -53,7 +57,8 @@ data class BracketConfig(
     val isoWeight: Float,
     val focalLengthMm: Float? = null,
     val optimizeForSaturation: Boolean = false,
-    val useBurstStacking: Boolean = false
+    val useBurstStacking: Boolean = false,
+    val targetSnr: Float = 0f
 )
 
 class CameraBracketController(
@@ -398,6 +403,9 @@ class CameraBracketController(
      * Burst stacking mode: captures a rapid burst at metered ISO (peak brightness ~127),
      * aligns frames, then synthesizes multiple "virtual exposures" via stacking.
      * This reduces motion blur and cumulative hand drift vs traditional bracketing.
+     *
+     * If targetSnr is set, captures frames adaptively until SNR target is reached,
+     * reducing capture time in bright scenes and extending in low-light scenes.
      */
     private suspend fun captureBurstStack(
         cam: CameraDevice,
@@ -418,12 +426,16 @@ class CameraBracketController(
         // Meter for ISO that brings peak brightness to ~127 (midpoint, leaving headroom)
         // Rather than bright-metering which peaks at 250, this reserves room above.
         val meteringIso = computeMeteredIsoForTarget(colorPipeline, baseExposureNs, isoRange)
-        val burstCount = config.steps + 3 // Capture extra frames for better stacking (noise reduction)
 
-        onStatus("Capturing burst ($burstCount frames)...")
+        // Determine burst length: fixed or adaptive based on SNR target
+        val maxBurstFrames = config.steps + 3 // Default: capture extra frames for stacking
+        var targetFrames = maxBurstFrames
+        var firstFrameSnr: Float? = null
+
+        onStatus("Capturing burst (analyzing noise)...")
         val burstFrames = mutableListOf<Bitmap>()
 
-        for (i in 0 until burstCount) {
+        for (i in 0 until maxBurstFrames) {
             // All frames at same ISO, same shutter, rapid capture minimizes hand drift
             var frame = captureOne(cam, sess, reader, meteringIso, baseExposureNs, chosenFocal, colorPipeline)
 
@@ -441,10 +453,32 @@ class CameraBracketController(
                 }
             }
             burstFrames.add(frame.bitmap)
-            onProgress(i + 1, burstCount)
+
+            // Adaptive termination: if target SNR is set, check if we've reached it
+            if (config.targetSnr > 0 && burstFrames.size <= maxBurstFrames / 2) {
+                val metrics = NoiseAnalysis.estimateFrameNoise(frame.bitmap)
+                if (firstFrameSnr == null) {
+                    firstFrameSnr = metrics.snr
+                    Log.i(TAG, "First frame SNR: %.2f".format(metrics.snr))
+                }
+
+                if (firstFrameSnr != null) {
+                    val stackedSnr = NoiseAnalysis.predictSnrAfterStacking(firstFrameSnr, burstFrames.size)
+                    Log.i(TAG, "Frame $i: Single SNR=%.2f, Stacked(${burstFrames.size})=%.2f".format(metrics.snr, stackedSnr))
+
+                    if (stackedSnr >= config.targetSnr) {
+                        targetFrames = burstFrames.size
+                        Log.i(TAG, "Target SNR ${config.targetSnr} reached at ${burstFrames.size} frames (stacked SNR=%.2f)".format(stackedSnr))
+                        onStatus("Target SNR reached, stopping burst...")
+                        break
+                    }
+                }
+            }
+
+            onProgress(i + 1, maxBurstFrames)
         }
 
-        onStatus("Aligning burst frames...")
+        onStatus("Aligning burst frames (${burstFrames.size} frames)...")
         val aligned = ImageAligner.alignAndCrop(burstFrames)
 
         onStatus("Synthesizing exposures from stack...")

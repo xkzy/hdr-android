@@ -16,10 +16,23 @@ highlights/shadows).
 | fx (focal length, mm) | locks `LENS_FOCAL_LENGTH` for every frame in the bracket. Leave blank to use the first available focal length. **This must stay fixed across the bracket** — the fusion algorithm assumes pixel (i,j) is the same scene point in every frame, so any focal-length or framing change between shots will misalign the fusion. |
 | Optimize for saturation | if enabled, uses a heuristic algorithm that concentrates exposures around mid-tones where saturation is typically highest, allowing the same number of frames to achieve better saturation coverage, or fewer frames to achieve the same coverage. Uses adaptive exposure spacing instead of uniform EV steps. |
 | Burst stacking | if enabled, captures a rapid burst at a single metered ISO (peak brightness ~127) with fixed shutter speed, then aligns frames and synthesizes multiple "virtual exposures" via intelligent stacking. Reduces motion blur vs traditional bracketing; combines frames to create exposure diversity without varying shutter/ISO per frame. Useful for handheld shots where capture speed and minimal cumulative hand drift matter most. |
+| Target SNR | when burst stacking is enabled, set this to enable adaptive frame capture. Frames are captured until the stacked SNR reaches the target, reducing capture time in bright scenes and extending in low-light. Set to 0 or blank to use a fixed frame count. Typical range 10-100. |
 
-## Burst stacking mode
+## Burst stacking mode with adaptive SNR-based capture
 
-When enabled, rather than capturing a bracket of different exposures (each with different ISO/shutter), the app captures a rapid burst at a **single, metered ISO** (chosen to peak around brightness 127) with a **fixed shutter speed**. Key benefits:
+When enabled, rather than capturing a bracket of different exposures (each with different ISO/shutter), the app captures a rapid burst at a **single, metered ISO** (chosen to peak around brightness 127) with a **fixed shutter speed**.
+
+### Adaptive frame capture
+
+Normally burst stacking captures a fixed number of frames. When "Target SNR" is set (>0), the app instead:
+1. Estimates noise from the first frame via Laplacian-based analysis
+2. Predicts SNR improvement as frames accumulate: SNR_stacked = SNR_single × √(N)
+3. Stops capturing when stacked SNR reaches the target
+4. Logs progress so the user sees real-time noise/SNR values
+
+This adapts to scene lighting: bright scenes reach target SNR in 3-4 frames (faster capture), while low-light scenes capture 10-15 frames (better noise reduction). The same target SNR threshold works across vastly different lighting conditions.
+
+### Key benefits
 
 - **Minimal motion blur**: All frames exposed identically with same duration; hand motion during any individual frame is minimized.
 - **Reduced cumulative drift**: Rapid burst means less hand drift accumulates between frames vs a multi-second bracket.

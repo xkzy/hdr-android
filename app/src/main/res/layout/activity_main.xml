@@ -150,6 +150,28 @@
                 android:textColor="#FFFFFF"
                 android:text="Burst stacking (fixed exposure, minimal blur)" />
 
+            <!-- Target SNR for adaptive burst length -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:orientation="horizontal">
+                <TextView
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:textColor="#FFFFFF"
+                    android:text="Target SNR (0=fixed frames)" />
+                <EditText
+                    android:id="@+id/editTargetSnr"
+                    android:layout_width="80dp"
+                    android:layout_height="wrap_content"
+                    android:inputType="numberDecimal"
+                    android:hint="0"
+                    android:textColorHint="#777777"
+                    android:textColor="#FFFFFF" />
+            </LinearLayout>
+
             <Button
                 android:id="@+id/captureButton"
                 android:layout_width="match_parent"
