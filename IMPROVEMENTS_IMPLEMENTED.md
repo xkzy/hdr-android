@@ -151,6 +151,58 @@ heuristic.
 
 ---
 
+## 5. Per-frame dynamic black level (`RawDemosaic.kt`, `CameraBracketController.kt`)
+
+**Problem addressed**: README's "remaining known simplifications" — black level was a
+single static per-camera value (`SENSOR_BLACK_LEVEL_PATTERN`), not each frame's own
+`SENSOR_DYNAMIC_BLACK_LEVEL`, so sensor drift (e.g. with temperature) across a multi-frame
+bracket wasn't tracked.
+
+**What changed**: `ColorPipeline.blackLevels` is now a per-CFA-channel `FloatArray`
+(R/Geven/Godd/B can each drift by a different offset) instead of one shared `Int`.
+`CameraBracketController.captureOne` now waits for each frame's own `TotalCaptureResult`
+and calls `RawDemosaic.withDynamicBlackLevel` to substitute that frame's
+`SENSOR_DYNAMIC_BLACK_LEVEL` in place of the static per-camera fallback, when the capture
+reported one.
+
+**What this does NOT do**: Still one offset per channel per frame, not a per-pixel
+calibration map — some sensors have subtle spatial black-level variation (banding) that a
+uniform per-channel offset can't correct.
+
+**Cost**: `captureOne` now serializes the RAW decode behind that frame's own capture
+result instead of firing the moment the image buffer arrives. In practice the result
+callback and the image-available callback land within the same capture, so this is not a
+meaningfully slower critical path — it removes a race rather than adding a real wait.
+
+---
+
+## 6. Lens-shading (vignetting) correction (`RawDemosaic.kt`, `CameraBracketController.kt`)
+
+**Problem addressed**: README's "remaining known simplifications" — the RAW pipeline
+didn't correct the sensor's own vignetting, unlike a JPEG where the ISP already applies it.
+
+**What changed**: When the device reports `STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES`
+supports `ON`, `captureOne` requests `STATISTICS_LENS_SHADING_MAP_MODE_ON` and reads back
+`STATISTICS_LENS_SHADING_CORRECTION_MAP` from that frame's capture result.
+`RawDemosaic.demosaic` bilinearly interpolates that grid (typically a few dozen cells per
+axis) into a per-channel gain multiplied into each raw sample before white balance.
+Precomputed once per raw pixel ahead of the main demosaic pass (not inline per sample call
+site), since bilinear demosaic re-reads each raw pixel from several neighboring output
+sites — inlining the shading lookup would have redone its own 4-point interpolation up to
+~9x per raw pixel.
+
+**What this does NOT do**: The shading grid is defined over the sensor's
+*pre-correction* active array, which is typically a few pixels larger than the active
+array this file already crops to; this treats the two as the same region, a small
+approximation on top of the bilinear grid interpolation itself, not an exact per-pixel
+calibration.
+
+**Cost**: One extra `FloatArray(w*h)` pass per RAW frame (a handful of float ops and array
+reads per pixel), done once regardless of how many downstream call sites read a given raw
+pixel during demosaic.
+
+---
+
 ## What remains genuinely unsolved (not attempted, and why)
 
 These are called out explicitly rather than silently left as before, because

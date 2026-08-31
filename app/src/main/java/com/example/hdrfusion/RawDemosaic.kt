@@ -3,7 +3,9 @@ package com.example.hdrfusion
 import android.graphics.Bitmap
 import android.graphics.Rect
 import android.hardware.camera2.CameraCharacteristics
+import android.hardware.camera2.params.BlackLevelPattern
 import android.hardware.camera2.params.ColorSpaceTransform
+import android.hardware.camera2.params.LensShadingMap
 import android.hardware.camera2.params.RggbChannelVector
 import android.media.Image
 import kotlinx.coroutines.Dispatchers
@@ -14,14 +16,15 @@ import kotlin.math.min
 import kotlin.math.pow
 
 /**
- * Minimal RAW_SENSOR -> sRGB pipeline: black-level subtraction, per-channel white
- * balance (from the metered "as-shot" gains/transform, so every bracket frame gets the
- * *same* color rendering), bilinear Bayer demosaic, sensor->sRGB color-correction matrix,
- * then the sRGB gamma. This gives the fusion stage genuine sensor bit depth (typically
- * 10-14 bits, versus the camera's baked-in 8-bit JPEG tone curve) to make its
- * per-pixel saturation comparison against — real headroom, at the cost of the ISP's own
- * noise reduction, sharpening, and lens-shading correction that a JPEG would already have
- * applied (none of that is reimplemented here).
+ * Minimal RAW_SENSOR -> sRGB pipeline: black-level subtraction (per-channel, using each
+ * frame's own dynamic black level when the camera reports one), lens-shading (vignetting)
+ * correction, per-channel white balance (from the metered "as-shot" gains/transform, so
+ * every bracket frame gets the *same* color rendering), bilinear Bayer demosaic,
+ * sensor->sRGB color-correction matrix, then the sRGB gamma. This gives the fusion stage
+ * genuine sensor bit depth (typically 10-14 bits, versus the camera's baked-in 8-bit JPEG
+ * tone curve) to make its per-pixel saturation comparison against — real headroom, at the
+ * cost of the ISP's own noise reduction and sharpening that a JPEG would already have
+ * applied (neither is reimplemented here; see LIMITATIONS.md).
  *
  * This does not produce or save a .dng file — DNG is a container format for RAW bytes
  * plus this same metadata, meant for external RAW processors; since the app needs
@@ -30,14 +33,65 @@ import kotlin.math.pow
  */
 object RawDemosaic {
 
-    /** Per-camera constants plus this shoot's metered white balance. */
+    /**
+     * Per-camera constants plus this shoot's metered white balance.
+     *
+     * [blackLevels] is per-CFA-channel (indexed the same way as [cfaChannelAt]: 0=R,
+     * 1=green-on-a-red-row, 2=green-on-a-blue-row, 3=B) rather than one shared value,
+     * since a sensor's four color channels can each drift by a different offset —
+     * [withDynamicBlackLevel] rebuilds this per frame from that capture's own
+     * `SENSOR_DYNAMIC_BLACK_LEVEL`, falling back to the static per-camera
+     * `SENSOR_BLACK_LEVEL_PATTERN` ([blackLevelsFromStaticPattern]) when a frame doesn't
+     * report one.
+     */
     data class ColorPipeline(
         val whiteLevel: Int,
-        val blackLevel: Int,
+        val blackLevels: FloatArray,
         val cfa: Int, // one of CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_*
         val gains: RggbChannelVector?,
-        val transform: ColorSpaceTransform?
+        val transform: ColorSpaceTransform?,
+        val shadingMap: LensShadingMap? = null
     )
+
+    /** Static per-camera fallback, from `CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN`. */
+    fun blackLevelsFromStaticPattern(cfa: Int, pattern: BlackLevelPattern?): FloatArray {
+        if (pattern == null) return floatArrayOf(64f, 64f, 64f, 64f)
+        return blackLevelsFromQuad(
+            cfa,
+            pattern.getOffsetForIndex(0, 0).toFloat(),
+            pattern.getOffsetForIndex(1, 0).toFloat(),
+            pattern.getOffsetForIndex(0, 1).toFloat(),
+            pattern.getOffsetForIndex(1, 1).toFloat()
+        )
+    }
+
+    /**
+     * Returns [pipeline] with its black levels replaced by this frame's own
+     * `CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL` (tracks sensor drift, e.g. with
+     * temperature, frame-to-frame) when the capture reported one, else [pipeline]
+     * unchanged (already carrying the static per-camera fallback).
+     */
+    fun withDynamicBlackLevel(pipeline: ColorPipeline, dynamic: FloatArray?): ColorPipeline {
+        if (dynamic == null || dynamic.size != 4) return pipeline
+        return pipeline.copy(
+            blackLevels = blackLevelsFromQuad(pipeline.cfa, dynamic[0], dynamic[1], dynamic[2], dynamic[3])
+        )
+    }
+
+    /**
+     * `SENSOR_BLACK_LEVEL_PATTERN`/`SENSOR_DYNAMIC_BLACK_LEVEL` both report their four
+     * values in raster order over the top-left 2x2 of the CFA — (0,0), (1,0), (0,1),
+     * (1,1) as (col,row) — which this maps onto this file's own R/Geven/Godd/B channel
+     * numbering via [cfaChannelAt] so the two stay consistent regardless of CFA layout.
+     */
+    private fun blackLevelsFromQuad(cfa: Int, q00: Float, q10: Float, q01: Float, q11: Float): FloatArray {
+        val levels = FloatArray(4)
+        levels[cfaChannelAt(cfa, 0, 0)] = q00
+        levels[cfaChannelAt(cfa, 0, 1)] = q10
+        levels[cfaChannelAt(cfa, 1, 0)] = q01
+        levels[cfaChannelAt(cfa, 1, 1)] = q11
+        return levels
+    }
 
     /**
      * Decodes one RAW_SENSOR [Image] into a display-referred ARGB_8888 [Bitmap], cropped to
@@ -76,7 +130,7 @@ object RawDemosaic {
         val w = activeArray.width().coerceAtMost(fullWidth - left)
         val h = activeArray.height().coerceAtMost(fullHeight - top)
 
-        val range = (pipeline.whiteLevel - pipeline.blackLevel).coerceAtLeast(1)
+        val range = FloatArray(4) { ch -> (pipeline.whiteLevel - pipeline.blackLevels[ch]).coerceAtLeast(1f) }
         val gains = pipeline.gains
         val rGain = gains?.red ?: 1f
         val gEvenGain = gains?.greenEven ?: 1f
@@ -84,10 +138,28 @@ object RawDemosaic {
         val bGain = gains?.blue ?: 1f
         val matrix = pipeline.transform?.toFloatMatrix()
 
+        // Bilinear demosaic samples each raw pixel from several call sites (its own output
+        // site plus neighbor/diagonal averaging for the other two channels at nearby
+        // sites) — up to ~9x per output pixel. The shading-map lookup itself is a 4-point
+        // bilinear interpolation, so evaluating it inline in `sampleNorm` would redo that
+        // work up to 9x per raw pixel; precomputing it once per raw pixel here keeps the
+        // per-sample path to a single array read, same as the black-level/white-balance data.
+        val shadingGain: FloatArray? = pipeline.shadingMap?.let { map ->
+            FloatArray(w * h) { i ->
+                val r = i / w
+                val c = i % w
+                shadingGainAt(map, cfaChannelAt(pipeline.cfa, r, c), r.toFloat() / h, c.toFloat() / w)
+            }
+        }
+
         fun sampleNorm(r: Int, c: Int): Float {
+            val channel = cfaChannelAt(pipeline.cfa, r, c)
             val v = raw[(top + r) * fullWidth + (left + c)].toInt() and 0xFFFF
-            val normalized = ((v - pipeline.blackLevel).toFloat() / range).coerceIn(0f, 1f)
-            val gain = when (cfaChannelAt(pipeline.cfa, r, c)) {
+            var normalized = ((v - pipeline.blackLevels[channel]) / range[channel]).coerceIn(0f, 1f)
+            if (shadingGain != null) {
+                normalized *= shadingGain[r * w + c]
+            }
+            val gain = when (channel) {
                 0 -> rGain
                 1 -> gEvenGain
                 2 -> gOddGain
@@ -176,6 +248,39 @@ object RawDemosaic {
                 if (evenRow) { if (evenCol) 3 else 2 } else { if (evenCol) 1 else 0 }
             else -> if (evenRow) { if (evenCol) 0 else 1 } else { if (evenCol) 2 else 3 } // assume RGGB
         }
+    }
+
+    /**
+     * Vignetting (lens-shading) correction gain for one raw-Bayer sample, via bilinear
+     * interpolation over the camera-reported shading grid. [rowFrac]/[colFrac] are this
+     * sample's position within the active array as a 0..1 fraction — the grid is much
+     * coarser than the sensor (typically single digits to a few dozen cells per axis) and
+     * is defined to cover the *pre-correction* active array, which is typically a few
+     * pixels larger than the active array this file crops to; treating the two as the same
+     * region here is a small approximation, not a phase error (unlike the CFA parity,
+     * which does need an exact crop).
+     */
+    private fun shadingGainAt(map: LensShadingMap, channel: Int, rowFrac: Float, colFrac: Float): Float {
+        val cols = map.columnCount
+        val rows = map.rowCount
+        if (cols < 1 || rows < 1) return 1f
+
+        val fx = (colFrac.coerceIn(0f, 1f) * (cols - 1))
+        val fy = (rowFrac.coerceIn(0f, 1f) * (rows - 1))
+        val x0 = fx.toInt().coerceIn(0, cols - 1)
+        val y0 = fy.toInt().coerceIn(0, rows - 1)
+        val x1 = (x0 + 1).coerceAtMost(cols - 1)
+        val y1 = (y0 + 1).coerceAtMost(rows - 1)
+        val tx = fx - x0
+        val ty = fy - y0
+
+        val g00 = map.getGainFactor(channel, x0, y0)
+        val g10 = map.getGainFactor(channel, x1, y0)
+        val g01 = map.getGainFactor(channel, x0, y1)
+        val g11 = map.getGainFactor(channel, x1, y1)
+        val top = g00 + (g10 - g00) * tx
+        val bottom = g01 + (g11 - g01) * tx
+        return top + (bottom - top) * ty
     }
 
     private inline fun neighborAvg4(sample: (Int, Int) -> Float, r: Int, c: Int, w: Int, h: Int): Float {

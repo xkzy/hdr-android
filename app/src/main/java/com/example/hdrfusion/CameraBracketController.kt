@@ -18,6 +18,7 @@ import android.util.Log
 import android.view.Surface
 import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -114,6 +115,15 @@ class CameraBracketController(
     private val activeArray: Rect =
         characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
             ?: Rect(0, 0, stillSize.width, stillSize.height)
+
+    /**
+     * Whether this device can report a per-frame lens-shading (vignetting correction) map
+     * alongside a RAW capture, so [RawDemosaic] can correct it instead of leaving the RAW
+     * pipeline's output with the sensor's raw vignetting baked in.
+     */
+    private val supportsLensShadingMap: Boolean =
+        characteristics.get(CameraCharacteristics.STATISTICS_INFO_AVAILABLE_LENS_SHADING_MAP_MODES)
+            ?.contains(CameraCharacteristics.STATISTICS_LENS_SHADING_MAP_MODE_ON) == true
 
     fun start() {
         bgThread = HandlerThread("hdrfusion-cam").also { it.start() }
@@ -225,16 +235,6 @@ class CameraBracketController(
         cont.invokeOnCancellation { runCatching { sess.stopRepeating() } }
     }
 
-    private fun averageBlackLevel(): Int {
-        val pattern = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
-        return if (pattern != null) {
-            (pattern.getOffsetForIndex(0, 0) + pattern.getOffsetForIndex(1, 0) +
-                pattern.getOffsetForIndex(0, 1) + pattern.getOffsetForIndex(1, 1)) / 4
-        } else {
-            64
-        }
-    }
-
     /**
      * Runs the full bracket: opens the camera, streams preview to [previewSurface], meters
      * a real auto-exposure value to center the bracket on, fires [BracketConfig.steps]
@@ -276,11 +276,15 @@ class CameraBracketController(
 
         val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
 
+        val cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+            ?: CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB
         val colorPipeline = RawDemosaic.ColorPipeline(
             whiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023,
-            blackLevel = averageBlackLevel(),
-            cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
-                ?: CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB,
+            blackLevels = RawDemosaic.blackLevelsFromStaticPattern(
+                cfa,
+                characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
+            ),
+            cfa = cfa,
             gains = metering.gains,
             transform = metering.transform
         )
@@ -348,15 +352,33 @@ class CameraBracketController(
         colorPipeline: RawDemosaic.ColorPipeline
     ): CapturedFrame {
         var exposureStartNs = 0L
+        // Only RAW captures need the per-frame capture result: it carries this frame's own
+        // dynamic black level and lens-shading map, which RawDemosaic uses in place of the
+        // static per-camera fallbacks baked into `colorPipeline`. JPEG frames need neither
+        // (the ISP already applied both), so this stays unused/uncompleted on that path.
+        val resultDeferred = CompletableDeferred<TotalCaptureResult>()
         val bitmap = suspendCancellableCoroutine<Bitmap> { cont ->
             reader.setOnImageAvailableListener({ r ->
                 val img: Image? = r.acquireLatestImage()
                 if (img != null) {
                     if (stillFormat == ImageFormat.RAW_SENSOR) {
                         processingScope.launch {
-                            val bmp = RawDemosaic.demosaic(img, activeArray, colorPipeline)
-                            img.close()
-                            if (cont.isActive) cont.resume(bmp)
+                            try {
+                                val result = resultDeferred.await()
+                                val dynamicBlackLevel = result.get(CaptureResult.SENSOR_DYNAMIC_BLACK_LEVEL)
+                                val shadingMap = result.get(CaptureResult.STATISTICS_LENS_SHADING_CORRECTION_MAP)
+                                val framePipeline = RawDemosaic.withDynamicBlackLevel(colorPipeline, dynamicBlackLevel)
+                                    .copy(shadingMap = shadingMap)
+                                val bmp = RawDemosaic.demosaic(img, activeArray, framePipeline)
+                                if (cont.isActive) cont.resume(bmp)
+                            } catch (t: Throwable) {
+                                // resultDeferred failed (capture error) or demosaic threw; the
+                                // image must still be closed below, or the reader's fixed-size
+                                // buffer pool starves every capture after it in this bracket.
+                                if (cont.isActive) cont.resumeWithException(t)
+                            } finally {
+                                img.close()
+                            }
                         }
                     } else {
                         val buffer = img.planes[0].buffer
@@ -376,6 +398,9 @@ class CameraBracketController(
                 set(CaptureRequest.SENSOR_SENSITIVITY, iso)
                 set(CaptureRequest.SENSOR_EXPOSURE_TIME, exposureNs)
                 focalMm?.let { set(CaptureRequest.LENS_FOCAL_LENGTH, it) }
+                if (stillFormat == ImageFormat.RAW_SENSOR && supportsLensShadingMap) {
+                    set(CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE, CaptureRequest.STATISTICS_LENS_SHADING_MAP_MODE_ON)
+                }
             }.build()
 
             sess.capture(request, object : CameraCaptureSession.CaptureCallback() {
@@ -387,11 +412,19 @@ class CameraBracketController(
                 ) {
                     exposureStartNs = timestamp
                 }
+                override fun onCaptureCompleted(
+                    session: CameraCaptureSession,
+                    request: CaptureRequest,
+                    result: TotalCaptureResult
+                ) {
+                    resultDeferred.complete(result)
+                }
                 override fun onCaptureFailed(
                     session: CameraCaptureSession,
                     request: CaptureRequest,
                     failure: CaptureFailure
                 ) {
+                    resultDeferred.completeExceptionally(RuntimeException("Capture failed: reason=${failure.reason}"))
                     if (cont.isActive) cont.resumeWithException(RuntimeException("Capture failed: reason=${failure.reason}"))
                 }
             }, bgHandler)

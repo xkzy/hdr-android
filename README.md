@@ -133,10 +133,9 @@ accelerometer at all, motion gating is skipped entirely and capture behaves as b
 
 ## Remaining known simplifications
 
-- Black level uses a single static per-camera value (`SENSOR_BLACK_LEVEL_PATTERN`) rather
-  than each frame's `SENSOR_DYNAMIC_BLACK_LEVEL`, which would track sensor drift (e.g. with
-  temperature) more precisely frame-to-frame.
-- Frame alignment is translation-only; it doesn't correct rotation, scale, or perspective
-  changes, and can't deghost a moving subject (see above).
-- The RAW demosaic doesn't reimplement the ISP's noise reduction, sharpening, or
-  lens-shading (vignetting) correction.
+- Frame alignment doesn't correct scale or perspective changes, and can't fully deghost a
+  moving subject — see `IMPROVEMENTS_IMPLEMENTED.md` for what rotation correction and the
+  ghost guard do and don't cover.
+- The RAW demosaic doesn't reimplement the ISP's noise reduction or sharpening — see
+  `IMPROVEMENTS_IMPLEMENTED.md` for the per-channel black level and lens-shading
+  corrections it does apply.
