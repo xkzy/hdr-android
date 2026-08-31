@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
-import android.hardware.camera2.params.StreamConfigurationMap
 import android.os.Bundle
 import android.provider.MediaStore
 import android.util.Size
@@ -111,15 +110,17 @@ class MainActivity : AppCompatActivity() {
         captureButton.isEnabled = false
         statusText.text = "Capturing 0/${config.steps}..."
 
-        // A modest still-capture size; swap for the sensor's max JPEG size in a production build.
-        val outSize = Size(1920, 1080)
-        texture.setDefaultBufferSize(outSize.width, outSize.height)
+        // Live preview stream stays modest for smooth rendering; the still-capture
+        // resolution (JPEG or RAW) is chosen independently, from the sensor's own max
+        // output size, inside CameraBracketController.
+        val previewSize = Size(1920, 1080)
+        texture.setDefaultBufferSize(previewSize.width, previewSize.height)
         val previewSurface = Surface(texture)
 
         scope.launch {
             try {
                 val frames = ctrl.captureBracket(
-                    previewSurface, outSize, config,
+                    previewSurface, config,
                     onProgress = { done, total ->
                         runOnUiThread { statusText.text = "Capturing $done/$total..." }
                     },

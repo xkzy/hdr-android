@@ -3,9 +3,12 @@ package com.example.hdrfusion
 import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
-import android.graphics.SurfaceTexture
+import android.graphics.ImageFormat
+import android.graphics.Rect
 import android.hardware.camera2.*
+import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.RggbChannelVector
 import android.hardware.camera2.params.SessionConfiguration
 import android.media.Image
 import android.media.ImageReader
@@ -15,6 +18,11 @@ import android.util.Log
 import android.view.Surface
 import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -50,6 +58,7 @@ class CameraBracketController(
     private var bgThread: HandlerThread? = null
     private var bgHandler: Handler? = null
     private var motionMonitor: MotionMonitor? = null
+    private val processingScope = CoroutineScope(Dispatchers.Default + SupervisorJob())
 
     private val characteristics: CameraCharacteristics =
         (context.getSystemService(Context.CAMERA_SERVICE) as CameraManager)
@@ -66,6 +75,33 @@ class CameraBracketController(
         characteristics.get(CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE) ==
             CameraCharacteristics.SENSOR_INFO_TIMESTAMP_SOURCE_REALTIME
 
+    /** RAW_SENSOR capture requires both the RAW capability and an actual RAW output size. */
+    private val supportsRaw: Boolean = run {
+        val caps = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+        val hasCap = caps?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) == true
+        val hasSize = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            ?.getOutputSizes(ImageFormat.RAW_SENSOR)?.isNotEmpty() == true
+        hasCap && hasSize
+    }
+
+    /**
+     * RAW_SENSOR when the device supports it (real sensor bit depth, demosaiced by
+     * [RawDemosaic]); otherwise JPEG at the sensor's largest available size, same as before
+     * but no longer hardcoded to a fixed 1920x1080 preview-sized still.
+     */
+    private val stillFormat: Int = if (supportsRaw) ImageFormat.RAW_SENSOR else ImageFormat.JPEG
+
+    private val stillSize: android.util.Size = run {
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+        map?.getOutputSizes(stillFormat)?.maxByOrNull { it.width.toLong() * it.height }
+            ?: android.util.Size(1920, 1080)
+    }
+
+    /** Valid image region within the raw pixel array (excludes the sensor's optically-black border). */
+    private val activeArray: Rect =
+        characteristics.get(CameraCharacteristics.SENSOR_INFO_ACTIVE_ARRAY_SIZE)
+            ?: Rect(0, 0, stillSize.width, stillSize.height)
+
     fun start() {
         bgThread = HandlerThread("hdrfusion-cam").also { it.start() }
         bgHandler = Handler(bgThread!!.looper)
@@ -81,6 +117,7 @@ class CameraBracketController(
         bgHandler = null
         motionMonitor?.stop()
         motionMonitor = null
+        processingScope.cancel()
     }
 
     @Suppress("MissingPermission")
@@ -124,14 +161,77 @@ class CameraBracketController(
         device!!.createCaptureSession(config)
     }
 
+    /** Result of the pre-bracket auto-exposure/auto-white-balance metering pass. */
+    private data class Metering(
+        val exposureNs: Long,
+        val gains: RggbChannelVector?,
+        val transform: ColorSpaceTransform?
+    )
+
     /**
-     * Runs the full bracket: opens the camera, streams preview to [previewSurface],
-     * fires [BracketConfig.steps] manual captures with ISO/shutter offset per stop,
-     * decodes each JPEG to a Bitmap, and returns them in capture order.
+     * Runs a short live-AE/AWB pass on the preview stream and returns the converged
+     * exposure time (used as the bracket's centre, replacing any hardcoded guess) plus the
+     * "as-shot" white-balance gains/color matrix (used to render every RAW bracket frame
+     * with consistent color, since the manual captures that follow run with AWB off).
+     * Best-effort: if AE never reports CONVERGED within [AE_METERING_MAX_FRAMES], whatever
+     * the last frame measured is used anyway rather than blocking indefinitely.
+     */
+    private suspend fun meterAutoExposure(
+        cam: CameraDevice,
+        sess: CameraCaptureSession,
+        previewSurface: Surface
+    ): Metering = suspendCancellableCoroutine { cont ->
+        val request = cam.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW).apply {
+            addTarget(previewSurface)
+            set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
+            set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+        }.build()
+
+        var frames = 0
+        val callback = object : CameraCaptureSession.CaptureCallback() {
+            override fun onCaptureCompleted(
+                session: CameraCaptureSession,
+                request: CaptureRequest,
+                result: TotalCaptureResult
+            ) {
+                frames++
+                val aeState = result.get(CaptureResult.CONTROL_AE_STATE)
+                val done = aeState == CaptureResult.CONTROL_AE_STATE_CONVERGED ||
+                    aeState == CaptureResult.CONTROL_AE_STATE_FLASH_REQUIRED ||
+                    frames >= AE_METERING_MAX_FRAMES
+                if (done && cont.isActive) {
+                    val exposureNs = result.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: DEFAULT_EXPOSURE_NS
+                    val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS)
+                    val transform = result.get(CaptureResult.COLOR_CORRECTION_TRANSFORM)
+                    runCatching { session.stopRepeating() }
+                    cont.resume(Metering(exposureNs, gains, transform))
+                }
+            }
+        }
+        sess.setRepeatingRequest(request, callback, bgHandler)
+        cont.invokeOnCancellation { runCatching { sess.stopRepeating() } }
+    }
+
+    private fun averageBlackLevel(): Int {
+        val pattern = characteristics.get(CameraCharacteristics.SENSOR_BLACK_LEVEL_PATTERN)
+        return if (pattern != null) {
+            (pattern.getOffsetForIndex(0, 0) + pattern.getOffsetForIndex(1, 0) +
+                pattern.getOffsetForIndex(0, 1) + pattern.getOffsetForIndex(1, 1)) / 4
+        } else {
+            64
+        }
+    }
+
+    /**
+     * Runs the full bracket: opens the camera, streams preview to [previewSurface], meters
+     * a real auto-exposure value to center the bracket on, fires [BracketConfig.steps]
+     * manual captures with ISO/shutter offset per stop (retaking any the IMU flags as
+     * motion-blurred), decodes each to a [Bitmap] (demosaicing in-process if this device
+     * shot RAW), aligns them against hand shake between frames, and returns them in
+     * capture order.
      */
     suspend fun captureBracket(
         previewSurface: Surface,
-        maxSize: android.util.Size,
         config: BracketConfig,
         onProgress: (Int, Int) -> Unit,
         onStatus: (String) -> Unit = {}
@@ -139,29 +239,38 @@ class CameraBracketController(
         val cam = device ?: openCamera()
         val motion = motionMonitor
 
+        val reader = ImageReader.newInstance(stillSize.width, stillSize.height, stillFormat, config.steps)
+        imageReader = reader
+
+        val sess = session ?: createSession(previewSurface, reader.surface)
+
+        onStatus(if (supportsRaw) "Metering (RAW capture)..." else "Metering exposure...")
+        val metering = meterAutoExposure(cam, sess, previewSurface)
+
         if (motion?.isAvailable == true) {
             onStatus("Hold steady...")
             motion.waitForStillness()
         }
-
-        val reader = ImageReader.newInstance(maxSize.width, maxSize.height, android.graphics.ImageFormat.JPEG, config.steps)
-        imageReader = reader
-
-        val sess = session ?: createSession(previewSurface, reader.surface)
 
         // Lock focal length (fx) if requested and the device exposes it.
         val focalLengths = characteristics.get(CameraCharacteristics.LENS_INFO_AVAILABLE_FOCAL_LENGTHS)
         val chosenFocal = config.focalLengthMm
             ?: focalLengths?.firstOrNull()
 
-        // Establish a reasonable base exposure time by reading the sensor's exposure range;
-        // in a production app you'd run a brief auto-exposure metering pass first and use
-        // its converged values as the centre of the bracket. Here we use a safe default
-        // and let per-step EV offsets fan out around it.
         val exposureRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-        val baseExposureNs = (exposureRange?.lower ?: 1_000_000L).coerceAtLeast(1_000_000L) * 8 // ~8ms default
+        val baseExposureNs = metering.exposureNs
+            .coerceIn(exposureRange?.lower ?: 1000L, exposureRange?.upper ?: 500_000_000L)
 
         val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+
+        val colorPipeline = RawDemosaic.ColorPipeline(
+            whiteLevel = characteristics.get(CameraCharacteristics.SENSOR_INFO_WHITE_LEVEL) ?: 1023,
+            blackLevel = averageBlackLevel(),
+            cfa = characteristics.get(CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT)
+                ?: CameraCharacteristics.SENSOR_INFO_COLOR_FILTER_ARRANGEMENT_RGGB,
+            gains = metering.gains,
+            transform = metering.transform
+        )
 
         val results = mutableListOf<Bitmap>()
 
@@ -178,7 +287,7 @@ class CameraBracketController(
             val exposureNs = (baseExposureNs * 2.0.pow(shutterEv.toDouble())).toLong()
                 .coerceIn(exposureRange?.lower ?: 1000L, exposureRange?.upper ?: 500_000_000L)
 
-            var frame = captureOne(cam, sess, reader, iso, exposureNs, chosenFocal)
+            var frame = captureOne(cam, sess, reader, iso, exposureNs, chosenFocal, colorPipeline)
             if (motion != null && motion.isAvailable && timestampsAreComparable) {
                 var attempt = 1
                 while (attempt < MAX_BLUR_RETRIES) {
@@ -189,7 +298,7 @@ class CameraBracketController(
                     if (exposureAngle <= MotionMonitor.BLUR_ANGLE_THRESHOLD_RAD) break
                     Log.w(TAG, "Step $k looked blurred (est. angle=$exposureAngle rad); retaking (attempt ${attempt + 1})")
                     onStatus("Motion detected, retaking frame ${k + 1}...")
-                    frame = captureOne(cam, sess, reader, iso, exposureNs, chosenFocal)
+                    frame = captureOne(cam, sess, reader, iso, exposureNs, chosenFocal, colorPipeline)
                     attempt++
                 }
             }
@@ -197,7 +306,8 @@ class CameraBracketController(
             onProgress(k + 1, config.steps)
         }
 
-        return results
+        onStatus("Aligning frames...")
+        return ImageAligner.alignAndCrop(results)
     }
 
     private data class CapturedFrame(val bitmap: Bitmap, val exposureStartNs: Long)
@@ -208,19 +318,28 @@ class CameraBracketController(
         reader: ImageReader,
         iso: Int,
         exposureNs: Long,
-        focalMm: Float?
+        focalMm: Float?,
+        colorPipeline: RawDemosaic.ColorPipeline
     ): CapturedFrame {
         var exposureStartNs = 0L
         val bitmap = suspendCancellableCoroutine<Bitmap> { cont ->
             reader.setOnImageAvailableListener({ r ->
                 val img: Image? = r.acquireLatestImage()
                 if (img != null) {
-                    val buffer = img.planes[0].buffer
-                    val bytes = ByteArray(buffer.remaining())
-                    buffer.get(bytes)
-                    img.close()
-                    val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    if (cont.isActive) cont.resume(bmp)
+                    if (stillFormat == ImageFormat.RAW_SENSOR) {
+                        processingScope.launch {
+                            val bmp = RawDemosaic.demosaic(img, activeArray, colorPipeline)
+                            img.close()
+                            if (cont.isActive) cont.resume(bmp)
+                        }
+                    } else {
+                        val buffer = img.planes[0].buffer
+                        val bytes = ByteArray(buffer.remaining())
+                        buffer.get(bytes)
+                        img.close()
+                        val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        if (cont.isActive) cont.resume(bmp)
+                    }
                 }
             }, bgHandler)
 
@@ -266,5 +385,11 @@ class CameraBracketController(
 
         /** Max capture attempts per bracket step before accepting a still-blurred frame. */
         private const val MAX_BLUR_RETRIES = 3
+
+        /** Give up waiting for AE_STATE_CONVERGED after this many preview frames. */
+        private const val AE_METERING_MAX_FRAMES = 30
+
+        /** Only used if a device somehow never reports an exposure time at all. */
+        private const val DEFAULT_EXPOSURE_NS = 8_000_000L
     }
 }

@@ -15,6 +15,47 @@ highlights/shadows).
 | ISO weight | 0..1 — how much of each EV step is realized via ISO vs shutter speed. 0 = classic shutter-only bracketing, 1 = ISO-only |
 | fx (focal length, mm) | locks `LENS_FOCAL_LENGTH` for every frame in the bracket. Leave blank to use the first available focal length. **This must stay fixed across the bracket** — the fusion algorithm assumes pixel (i,j) is the same scene point in every frame, so any focal-length or framing change between shots will misalign the fusion. |
 
+## Capture pipeline
+
+Each shoot runs, in order:
+
+1. **Metering.** A short live auto-exposure/auto-white-balance pass on the preview stream
+   (`CameraBracketController.meterAutoExposure`) reads a real converged exposure time from
+   the scene — replacing what used to be a hardcoded ~8ms guess — and centers the bracket's
+   per-step EV offsets on it. It also captures the "as-shot" white-balance gains/color
+   matrix, used below to render every RAW frame with the same colors.
+2. **Anti motion blur** (see below) — a steadiness gate before the shoot, and per-frame
+   blur detection/retakes during it.
+3. **Manual bracket capture**, at the sensor's largest available resolution for whichever
+   format this device shoots (see RAW vs JPEG below) rather than a fixed preview-sized
+   still.
+4. **Alignment.** `ImageAligner` compensates for hand shake *between* frames — the hand can
+   drift a few pixels over the second or two a multi-step bracket takes, even with fx
+   locked — by finding the translational offset that best cross-correlates each frame
+   against the first, then cropping every frame to their common overlap. This does not
+   handle a moving subject in the scene; per-pixel argmax fusion has no way to deghost that
+   without full per-object motion estimation, which is out of scope here.
+5. **Fusion** via `SaturationFusion`, and save.
+
+### RAW vs JPEG
+
+On a device that reports the `RAW` capability and a `RAW_SENSOR` output size,
+`CameraBracketController` captures unprocessed sensor data instead of JPEG and
+`RawDemosaic` turns it into a `Bitmap` itself: black-level subtraction, the metered
+white-balance gains, bilinear Bayer demosaic (from whatever CFA arrangement — RGGB /
+GRBG / GBRG / BGGR — the sensor reports), the sensor->sRGB color-correction matrix, then
+the sRGB gamma. This hands the fusion stage the sensor's real bit depth (typically 10-14
+bits) instead of the camera's baked-in 8-bit JPEG tone curve — genuine headroom for the
+per-pixel saturation comparison — at the cost of the ISP's own noise reduction,
+sharpening, and lens-shading correction that a JPEG would already have applied, none of
+which is reimplemented here. It's a pure-Kotlin demosaic with no native/GPU acceleration,
+so on a high-megapixel sensor it is measurably slower than the JPEG path. On a device
+without RAW capability, capture falls back to JPEG at the sensor's max resolution, same
+as before. Note this pipeline decodes straight to RGB rather than writing a `.dng` file —
+DNG is a container for these same raw bytes/metadata meant for external RAW processors,
+and since fusion needs demosaiced pixels in-process anyway, that intermediate step is
+skipped.
+
 ## Anti motion blur
 
 The camera stays fixed (fx locked, see above), but a handheld shot can still blur an
@@ -35,24 +76,26 @@ accelerometer at all, motion gating is skipped entirely and capture behaves as b
 
 ## Files
 
-- `CameraBracketController.kt` — opens the camera, computes per-step ISO/exposure-time
-  from the EV/ISO-weight settings, fires manual captures (AE/AF locked off), decodes JPEGs,
-  and retakes frames the IMU flags as blurred.
+- `CameraBracketController.kt` — opens the camera, meters exposure/white-balance, computes
+  per-step ISO/exposure-time from the EV/ISO-weight settings, fires manual captures
+  (AE/AF locked off) at the sensor's max resolution (RAW or JPEG), and retakes frames the
+  IMU flags as blurred.
+- `RawDemosaic.kt` — RAW_SENSOR -> sRGB `Bitmap` pipeline (black level, white balance,
+  Bayer demosaic, color correction, gamma), used when the device supports RAW capture.
+- `ImageAligner.kt` — cross-correlation-based translational alignment/crop to remove
+  hand-shake drift between bracket frames before fusion.
 - `MotionMonitor.kt` — wraps the gyroscope/accelerometer to detect handheld shake for the
   anti motion blur gating above.
 - `SaturationFusion.kt` — the argmax-saturation fusion core; parallelized by row-band.
 - `MainActivity.kt` — preview, permission handling, wiring, saves the fused JPEG to
   `Pictures/HDRFusion` via MediaStore.
 
-## Known simplifications (call these out if you productionize this)
+## Remaining known simplifications
 
-- No image alignment/deghosting across frames — assumes a static scene/tripod, since
-  fusion is strictly per-pixel across frames of identical framing (that's why fx is
-  locked); the anti motion blur gating above only guards against blur *within* a single
-  frame's own exposure, not the subject or camera moving between frames.
-- Base exposure time is a hardcoded default rather than a metered auto-exposure read; wire
-  up a short AE-converge pass before the bracket for real scenes.
-- Still-capture size is fixed at 1920x1080 for simplicity; swap in the sensor's max JPEG
-  size from `StreamConfigurationMap` for full resolution.
-- JPEG (8-bit) capture is used for simplicity; for real HDR headroom, capture RAW/DNG
-  (`ImageFormat.RAW_SENSOR`) instead and demosaic before fusing.
+- Black level uses a single static per-camera value (`SENSOR_BLACK_LEVEL_PATTERN`) rather
+  than each frame's `SENSOR_DYNAMIC_BLACK_LEVEL`, which would track sensor drift (e.g. with
+  temperature) more precisely frame-to-frame.
+- Frame alignment is translation-only; it doesn't correct rotation, scale, or perspective
+  changes, and can't deghost a moving subject (see above).
+- The RAW demosaic doesn't reimplement the ISP's noise reduction, sharpening, or
+  lens-shading (vignetting) correction.
