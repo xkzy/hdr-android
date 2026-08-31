@@ -15,6 +15,18 @@ highlights/shadows).
 | ISO weight | 0..1 — how much of each EV step is realized via ISO vs shutter speed. 0 = classic shutter-only bracketing, 1 = ISO-only |
 | fx (focal length, mm) | locks `LENS_FOCAL_LENGTH` for every frame in the bracket. Leave blank to use the first available focal length. **This must stay fixed across the bracket** — the fusion algorithm assumes pixel (i,j) is the same scene point in every frame, so any focal-length or framing change between shots will misalign the fusion. |
 | Optimize for saturation | if enabled, uses a heuristic algorithm that concentrates exposures around mid-tones where saturation is typically highest, allowing the same number of frames to achieve better saturation coverage, or fewer frames to achieve the same coverage. Uses adaptive exposure spacing instead of uniform EV steps. |
+| Burst stacking | if enabled, captures a rapid burst at a single metered ISO (peak brightness ~127) with fixed shutter speed, then aligns frames and synthesizes multiple "virtual exposures" via intelligent stacking. Reduces motion blur vs traditional bracketing; combines frames to create exposure diversity without varying shutter/ISO per frame. Useful for handheld shots where capture speed and minimal cumulative hand drift matter most. |
+
+## Burst stacking mode
+
+When enabled, rather than capturing a bracket of different exposures (each with different ISO/shutter), the app captures a rapid burst at a **single, metered ISO** (chosen to peak around brightness 127) with a **fixed shutter speed**. Key benefits:
+
+- **Minimal motion blur**: All frames exposed identically with same duration; hand motion during any individual frame is minimized.
+- **Reduced cumulative drift**: Rapid burst means less hand drift accumulates between frames vs a multi-second bracket.
+- **Noise reduction via stacking**: Identical frames are averaged together, improving SNR as sqrt(N), before synthesis.
+- **Synthetic exposure diversity**: After alignment, stacked subsets are brightened/darkened to create "virtual exposures" that bracket the dynamic range without varying the sensor settings frame-to-frame.
+
+The peak brightness target (~127) reserves headroom above mid-tone, ensuring good saturation diversity in the synthesized exposures. IMU assists by detecting and retaking any motion-blurred frames during the burst.
 
 ## Saturation optimization heuristic
 

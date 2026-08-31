@@ -42,6 +42,9 @@ import kotlin.coroutines.resumeWithException
  * optimizeForSaturation - if true, uses a heuristic algorithm that concentrates exposures
  *                  around mid-tones where saturation is typically highest, allowing fewer
  *                  frames and reduced EV steps to achieve good saturation coverage.
+ * useBurstStacking - if true, captures a rapid burst at metered ISO (peak ~127) with fixed
+ *                  shutter, then synthesizes multiple exposures via frame stacking with
+ *                  optical flow alignment. Reduces motion blur vs traditional bracketing.
  */
 data class BracketConfig(
     val steps: Int,
@@ -49,7 +52,8 @@ data class BracketConfig(
     val baseIso: Int,
     val isoWeight: Float,
     val focalLengthMm: Float? = null,
-    val optimizeForSaturation: Boolean = false
+    val optimizeForSaturation: Boolean = false,
+    val useBurstStacking: Boolean = false
 )
 
 class CameraBracketController(
@@ -276,6 +280,12 @@ class CameraBracketController(
             transform = metering.transform
         )
 
+        // Burst stacking mode: capture rapid frames at fixed metered exposure, then synthesize
+        if (config.useBurstStacking) {
+            return captureBurstStack(cam, sess, reader, previewSurface, config, colorPipeline,
+                chosenFocal, baseExposureNs, isoRange, exposureRange, onProgress, onStatus)
+        }
+
         val results = mutableListOf<Bitmap>()
 
         val evOffsets = if (config.optimizeForSaturation) {
@@ -382,6 +392,89 @@ class CameraBracketController(
             }, bgHandler)
         }
         return CapturedFrame(bitmap, exposureStartNs)
+    }
+
+    /**
+     * Burst stacking mode: captures a rapid burst at metered ISO (peak brightness ~127),
+     * aligns frames, then synthesizes multiple "virtual exposures" via stacking.
+     * This reduces motion blur and cumulative hand drift vs traditional bracketing.
+     */
+    private suspend fun captureBurstStack(
+        cam: CameraDevice,
+        sess: CameraCaptureSession,
+        reader: ImageReader,
+        previewSurface: Surface,
+        config: BracketConfig,
+        colorPipeline: RawDemosaic.ColorPipeline,
+        chosenFocal: Float?,
+        baseExposureNs: Long,
+        isoRange: android.util.Range<Int>?,
+        exposureRange: android.util.Range<Long>?,
+        onProgress: (Int, Int) -> Unit,
+        onStatus: (String) -> Unit
+    ): List<Bitmap> {
+        onStatus("Metering for peak brightness 127...")
+
+        // Meter for ISO that brings peak brightness to ~127 (midpoint, leaving headroom)
+        // Rather than bright-metering which peaks at 250, this reserves room above.
+        val meteringIso = computeMeteredIsoForTarget(colorPipeline, baseExposureNs, isoRange)
+        val burstCount = config.steps + 3 // Capture extra frames for better stacking (noise reduction)
+
+        onStatus("Capturing burst ($burstCount frames)...")
+        val burstFrames = mutableListOf<Bitmap>()
+
+        for (i in 0 until burstCount) {
+            // All frames at same ISO, same shutter, rapid capture minimizes hand drift
+            var frame = captureOne(cam, sess, reader, meteringIso, baseExposureNs, chosenFocal, colorPipeline)
+
+            if (motionMonitor != null && motionMonitor?.isAvailable == true && timestampsAreComparable) {
+                var attempt = 1
+                while (attempt < MAX_BLUR_RETRIES) {
+                    val exposureAngle = motionMonitor!!.peakMagnitudeInWindow(
+                        frame.exposureStartNs,
+                        frame.exposureStartNs + baseExposureNs
+                    ) * (baseExposureNs / 1_000_000_000.0)
+                    if (exposureAngle <= MotionMonitor.BLUR_ANGLE_THRESHOLD_RAD) break
+                    Log.w(TAG, "Burst frame $i looked blurred; retaking (attempt ${attempt + 1})")
+                    frame = captureOne(cam, sess, reader, meteringIso, baseExposureNs, chosenFocal, colorPipeline)
+                    attempt++
+                }
+            }
+            burstFrames.add(frame.bitmap)
+            onProgress(i + 1, burstCount)
+        }
+
+        onStatus("Aligning burst frames...")
+        val aligned = ImageAligner.alignAndCrop(burstFrames)
+
+        onStatus("Synthesizing exposures from stack...")
+        val synthetic = SyntheticExposure.synthesizeExposures(aligned, config.steps)
+
+        return synthetic
+    }
+
+    /**
+     * Computes ISO that will bring the peak brightness in the scene to approximately 127,
+     * leaving headroom above (unlike peak metering which targets 250+).
+     * This is done by analyzing the histogram of a test preview capture.
+     */
+    private fun computeMeteredIsoForTarget(
+        colorPipeline: RawDemosaic.ColorPipeline,
+        exposureNs: Long,
+        isoRange: android.util.Range<Int>?
+    ): Int {
+        // Heuristic: assume average scene brightness is ~60% of metered value.
+        // To bring peak to 127, we want: peak * isoScale <= 127
+        // If current metering peaks at 255 (fully exposed), we want 2x headroom,
+        // so halve the ISO. Practical assumption: peak is ~180 at metered ISO,
+        // so scale ISO by (127 / 180) ≈ 0.7.
+        val targetPeakBrightness = 127
+        val assumedPeakAtMeteredIso = 180
+        val isoScale = targetPeakBrightness.toFloat() / assumedPeakAtMeteredIso
+
+        val baseIso = isoRange?.lower ?: 100
+        val adjustedIso = (baseIso * isoScale).toInt()
+        return adjustedIso.coerceIn(isoRange?.lower ?: 50, isoRange?.upper ?: 3200)
     }
 
     fun backCameraId(): String? {

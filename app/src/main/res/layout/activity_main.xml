@@ -141,6 +141,15 @@
                 android:textColor="#FFFFFF"
                 android:text="Optimize for saturation (fewer frames, adaptive spacing)" />
 
+            <!-- Burst stacking mode -->
+            <CheckBox
+                android:id="@+id/checkBurstStacking"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
+                android:textColor="#FFFFFF"
+                android:text="Burst stacking (fixed exposure, minimal blur)" />
+
             <Button
                 android:id="@+id/captureButton"
                 android:layout_width="match_parent"

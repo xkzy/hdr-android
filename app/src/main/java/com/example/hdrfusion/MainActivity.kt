@@ -33,6 +33,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var editIsoWeight: EditText
     private lateinit var editFocal: EditText
     private lateinit var checkOptimizeSaturation: CheckBox
+    private lateinit var checkBurstStacking: CheckBox
 
     private var controller: CameraBracketController? = null
     private val scope = MainScope()
@@ -58,6 +59,7 @@ class MainActivity : AppCompatActivity() {
         editIsoWeight = findViewById(R.id.editIsoWeight)
         editFocal = findViewById(R.id.editFocal)
         checkOptimizeSaturation = findViewById(R.id.checkOptimizeSaturation)
+        checkBurstStacking = findViewById(R.id.checkBurstStacking)
 
         captureButton.setOnClickListener { runBracketAndFuse() }
 
@@ -108,7 +110,8 @@ class MainActivity : AppCompatActivity() {
             baseIso = baseIso,
             isoWeight = isoWeight,
             focalLengthMm = focal,
-            optimizeForSaturation = checkOptimizeSaturation.isChecked
+            optimizeForSaturation = checkOptimizeSaturation.isChecked,
+            useBurstStacking = checkBurstStacking.isChecked
         )
 
         captureButton.isEnabled = false
